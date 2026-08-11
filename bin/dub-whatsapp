@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="$PROJECT_DIR/.venv"
+MODELS_DIR="$PROJECT_DIR/.models"
+
+WHISPER_BIN="${WHISPER_BIN:-whisper-cli}"
+WHISPER_MODEL_PATH="${WHISPER_MODEL_PATH:-$MODELS_DIR/ggml-large-v3-turbo.bin}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2:3b}"
+QWEN_TTS_MODEL="${QWEN_TTS_MODEL:-mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16}"
+INPUT_LANGUAGE="Spanish"
+INPUT_LANGUAGE_CODE="es"
+OUTPUT_LANGUAGE="English"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dub-whatsapp [OPTIONS] INPUT_AUDIO [OUTPUT_AUDIO]
+
+Example:
+  dub-whatsapp ~/Downloads/voice-note.ogg
+  dub-whatsapp ~/Downloads/voice-note.ogg ~/Desktop/voice-note-en.ogg
+  dub-whatsapp ~/Downloads/voice-note.ogg ~/Desktop/voice-note-en.mp3
+  dub-whatsapp --input-language Portuguese --input-language-code pt --output-language English input.ogg output.ogg
+  dub-whatsapp --input-language Spanish --input-language-code es --output-language French input.ogg output.ogg
+
+Options:
+  --input-language NAME       Source language name for translation prompt, default Spanish
+  --input-language-code CODE  Source language code for whisper.cpp, default es
+  --output-language NAME      Target language name for translation and TTS, default English
+  -h, --help                  Show this help
+
+Environment:
+  OLLAMA_MODEL          Translation model, default llama3.2:3b
+  QWEN_TTS_MODEL        MLX-Audio Qwen3-TTS model
+  WHISPER_MODEL_PATH    whisper.cpp model path
+  KEEP_WORK=1           Keep intermediate files
+EOF
+}
+
+fail() {
+  printf 'dub-whatsapp: %s\n' "$1" >&2
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --input-language)
+      [[ -n "${2:-}" ]] || fail "--input-language requires a value"
+      INPUT_LANGUAGE="$2"
+      shift 2
+      ;;
+    --input-language-code)
+      [[ -n "${2:-}" ]] || fail "--input-language-code requires a value"
+      INPUT_LANGUAGE_CODE="$2"
+      shift 2
+      ;;
+    --output-language)
+      [[ -n "${2:-}" ]] || fail "--output-language requires a value"
+      OUTPUT_LANGUAGE="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      fail "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+INPUT="${1:-}"
+[[ -n "$INPUT" ]] || { usage; exit 2; }
+[[ -f "$INPUT" ]] || fail "input audio not found: $INPUT"
+
+if [[ -n "${2:-}" ]]; then
+  OUTPUT="$2"
+else
+  base="$(basename "$INPUT")"
+  OUTPUT="${PWD}/${base%.*}.en.ogg"
+fi
+case "$(basename "$OUTPUT")" in
+  *.*) ;;
+  *) OUTPUT="${OUTPUT}.ogg" ;;
+esac
+
+OUTPUT_DIR="$(dirname "$OUTPUT")"
+mkdir -p "$OUTPUT_DIR"
+OUTPUT="$(cd "$OUTPUT_DIR" && pwd)/$(basename "$OUTPUT")"
+OUTPUT_EXT="${OUTPUT##*.}"
+OUTPUT_EXT="$(printf '%s' "$OUTPUT_EXT" | tr '[:upper:]' '[:lower:]')"
+
+[[ -x "$VENV_DIR/bin/python" ]] || fail "Python environment missing. Run ./setup.sh first."
+command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg missing. Run ./setup.sh first."
+command -v "$WHISPER_BIN" >/dev/null 2>&1 || fail "$WHISPER_BIN missing. Run ./setup.sh first."
+command -v ollama >/dev/null 2>&1 || fail "ollama missing. Run ./setup.sh first."
+[[ -s "$WHISPER_MODEL_PATH" ]] || fail "Whisper model missing at $WHISPER_MODEL_PATH. Run ./setup.sh first."
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dub-whatsapp.XXXXXX")"
+cleanup() {
+  if [[ "${KEEP_WORK:-0}" == "1" ]]; then
+    printf 'Keeping work files: %s\n' "$WORK_DIR" >&2
+  else
+    rm -rf "$WORK_DIR"
+  fi
+}
+trap cleanup EXIT
+
+WAV_16K="$WORK_DIR/input-16k.wav"
+TRANSCRIPT_PREFIX="$WORK_DIR/transcript"
+TRANSCRIPT_TXT="$TRANSCRIPT_PREFIX.txt"
+ENGLISH_TXT="$WORK_DIR/english.txt"
+TTS_WAV="$WORK_DIR/english.wav"
+
+printf 'Final output will be: %s\n' "$OUTPUT"
+printf 'Temporary work folder: %s\n' "$WORK_DIR"
+printf 'Input language: %s (%s)\n' "$INPUT_LANGUAGE" "$INPUT_LANGUAGE_CODE"
+printf 'Output language: %s\n' "$OUTPUT_LANGUAGE"
+
+printf 'Preparing audio...\n'
+ffmpeg -hide_banner -loglevel error -y -i "$INPUT" -vn -ac 1 -ar 16000 "$WAV_16K"
+
+printf 'Transcribing %s with whisper.cpp...\n' "$INPUT_LANGUAGE"
+"$WHISPER_BIN" \
+  -m "$WHISPER_MODEL_PATH" \
+  -f "$WAV_16K" \
+  -l "$INPUT_LANGUAGE_CODE" \
+  -otxt \
+  -of "$TRANSCRIPT_PREFIX" >/dev/null
+
+[[ -s "$TRANSCRIPT_TXT" ]] || fail "transcription produced no text"
+
+printf 'Translating to %s with Ollama...\n' "$OUTPUT_LANGUAGE"
+"$VENV_DIR/bin/python" "$PROJECT_DIR/src/dub_whatsapp/translate.py" \
+  --model "$OLLAMA_MODEL" \
+  --input "$TRANSCRIPT_TXT" \
+  --input-language "$INPUT_LANGUAGE" \
+  --output-language "$OUTPUT_LANGUAGE" \
+  --output "$ENGLISH_TXT"
+
+[[ -s "$ENGLISH_TXT" ]] || fail "translation produced no text"
+
+printf 'Synthesizing cloned %s voice with Qwen3-TTS...\n' "$OUTPUT_LANGUAGE"
+"$VENV_DIR/bin/python" -u "$PROJECT_DIR/src/dub_whatsapp/tts_qwen3.py" \
+  --model "$QWEN_TTS_MODEL" \
+  --text "$ENGLISH_TXT" \
+  --ref-audio "$WAV_16K" \
+  --ref-text "$TRANSCRIPT_TXT" \
+  --language "$OUTPUT_LANGUAGE" \
+  --output "$TTS_WAV"
+
+[[ -s "$TTS_WAV" ]] || fail "TTS produced no audio"
+
+case "$OUTPUT_EXT" in
+  ogg|opus)
+    printf 'Encoding final WhatsApp-compatible OGG/Opus...\n'
+    ffmpeg -hide_banner -loglevel error -y -i "$TTS_WAV" \
+      -vn -ac 1 -ar 48000 -c:a libopus -b:a 48k -application voip "$OUTPUT"
+    ;;
+  mp3)
+    printf 'Encoding final MP3...\n'
+    ffmpeg -hide_banner -loglevel error -y -i "$TTS_WAV" \
+      -vn -ac 1 -ar 44100 -c:a libmp3lame -b:a 128k "$OUTPUT"
+    ;;
+  m4a|mp4|aac)
+    printf 'Encoding final M4A...\n'
+    ffmpeg -hide_banner -loglevel error -y -i "$TTS_WAV" \
+      -vn -ac 1 -ar 44100 -c:a aac -b:a 160k "$OUTPUT"
+    ;;
+  *)
+    fail "unsupported output extension .$OUTPUT_EXT. Use .ogg, .opus, .mp3, or .m4a"
+    ;;
+esac
+
+printf 'Done: %s\n' "$OUTPUT"
